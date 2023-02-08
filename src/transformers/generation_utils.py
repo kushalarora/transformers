@@ -13,14 +13,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import copy
 import inspect
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
+
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 
 from .generation_beam_constraints import Constraint, DisjunctiveConstraint, PhrasalConstraint
@@ -54,6 +57,7 @@ from .generation_stopping_criteria import (
 from .pytorch_utils import torch_int_div
 from .utils import ModelOutput, logging
 
+from collections import deque
 
 logger = logging.get_logger(__name__)
 
@@ -85,6 +89,15 @@ class GreedySearchDecoderOnlyOutput(ModelOutput):
     attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
 
+@dataclass
+class EntropyAwareDecodingDecoderOnlyOutput(GreedySearchDecoderOnlyOutput):
+    pct_entropy_violations: torch.LongTensor = None
+    pct_lower_entropy_violations: torch.LongTensor = None
+    pct_upper_entropy_violations: torch.LongTensor = None
+    entropy_violations: torch.LongTensor = None
+    entropies: torch.FloatTensor = None
+    entropy_aware_actions: torch.LongTensor = None
+    backoff_indexes: List[List] = None
 
 @dataclass
 class GreedySearchEncoderDecoderOutput(ModelOutput):
@@ -127,7 +140,15 @@ class GreedySearchEncoderDecoderOutput(ModelOutput):
     cross_attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     decoder_hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
 
-
+@dataclass
+class EntropyAwareDecodingEncoderDecoderOutput(GreedySearchEncoderDecoderOutput):
+    pct_entropy_violations: torch.LongTensor = None
+    pct_lower_entropy_violations: torch.LongTensor = None
+    pct_upper_entropy_violations: torch.LongTensor = None
+    entropy_violations: torch.LongTensor = None
+    entropies: torch.FloatTensor = None
+    entropy_aware_actions: torch.LongTensor = None
+    backoff_indexes: List[List] = None
 @dataclass
 class SampleDecoderOnlyOutput(ModelOutput):
     """
@@ -511,7 +532,7 @@ class GenerationMixin:
         encoder = self.get_encoder()
 
         # 2. prepare encoder args and encoder kwargs from model kwargs
-        irrelevant_prefix = ["decoder_", "cross_attn", "use_cache"]
+        irrelevant_prefix = ["decoder_", "cross_attn", "use_cache", "ea_"]
         encoder_kwargs = {
             argument: value
             for argument, value in model_kwargs.items()
@@ -841,6 +862,59 @@ class GenerationMixin:
 
         return transition_scores
 
+    def _save_state_for_entropy_aware_backoff(self,
+            next_token_scores, scores, decoder_attentions, 
+            cross_attentions, decoder_hidden_states,
+             past_key_values, model_kwargs, input_ids,
+             index, state, rank_at_current_index,
+             steps_since_last_good_index,
+             next_tokens, unfinished_sequences, cur_len,
+            ):
+        state_dict = {
+            'next_token_scores': copy.deepcopy(next_token_scores),
+            'scores': copy.deepcopy(scores),
+            'decoder_attentions': copy.deepcopy(decoder_attentions),
+            'cross_attentions': copy.deepcopy(cross_attentions),
+            'decoder_hidden_states': copy.deepcopy(decoder_hidden_states),
+            'past_key_values': copy.deepcopy(past_key_values),
+            'model_kwargs': copy.deepcopy(model_kwargs),
+            "input_ids": copy.deepcopy(input_ids),
+            "index": copy.deepcopy(index),
+            "state": copy.deepcopy(state),
+            'ranks': copy.deepcopy(rank_at_current_index),
+            'steps_since_last_good_index': copy.deepcopy(steps_since_last_good_index),
+            'next_tokens': copy.deepcopy(next_tokens),
+            'unfinished_sequences': copy.deepcopy(unfinished_sequences),
+            'cur_len': cur_len,
+        }
+        self.queue.append(state_dict)
+
+    def _load_state_for_entropy_aware_backoff(self):
+        state_dict = self.queue.popleft()
+        return {
+            'next_token_scores': state_dict['next_token_scores'],
+            'scores': state_dict['scores'],
+            'decoder_attentions': copy.deepcopy(state_dict['decoder_attentions']),
+            'cross_attentions': copy.deepcopy(state_dict['cross_attentions']),
+            'decoder_hidden_states': copy.deepcopy(state_dict['decoder_hidden_states']),
+            'past_key_values': copy.deepcopy(state_dict['past_key_values']),
+            'model_kwargs': copy.deepcopy(state_dict['model_kwargs']),
+            "input_ids": copy.deepcopy(state_dict['input_ids']),
+            "index": copy.deepcopy(state_dict['index']),
+            "state": copy.deepcopy(state_dict['state']),
+            'ranks': copy.deepcopy(state_dict['ranks']),
+            'steps_since_last_good_index': copy.deepcopy(state_dict['steps_since_last_good_index']),
+            'next_tokens': copy.deepcopy(state_dict['next_tokens']),
+            'unfinished_sequences': copy.deepcopy(state_dict['unfinished_sequences']),
+            'cur_len': state_dict['cur_len'],
+        }
+
+    def _get_rank(self, logits, next_tokens):
+        sorted_logits = torch.sort(logits, descending=True, dim=1)[0]
+        values = torch.gather(logits, -1, next_tokens[:, None])
+        rank = (sorted_logits > values).long().sum(dim=1, keepdim=True)
+        return rank
+
     @torch.no_grad()
     def generate(
         self,
@@ -854,6 +928,9 @@ class GenerationMixin:
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         typical_p: Optional[float] = None,
+        entropy_aware_human_mean_coeffs: Optional[Tuple[float]] = None, 
+        entropy_aware_human_std_coeffs: Optional[Tuple[float]] = None, 
+        entropy_aware_human_std_band: Optional[float] = None, 
         repetition_penalty: Optional[float] = None,
         bad_words_ids: Optional[Iterable[int]] = None,
         force_words_ids: Optional[Union[Iterable[int], Iterable[Iterable[int]]]] = None,
@@ -1232,21 +1309,29 @@ class GenerationMixin:
                 "`max_new_tokens`."
             )
 
+        is_entropy_aware_mode = (entropy_aware_human_mean_coeffs is not None and 
+                                    entropy_aware_human_std_coeffs is not None and 
+                                    entropy_aware_human_std_band is not None)
+
         # 6. determine generation mode
         is_constraint_gen_mode = constraints is not None or force_words_ids is not None
         is_greedy_gen_mode = (
-            (num_beams == 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode
+            (num_beams == 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode and not is_entropy_aware_mode
         )
         is_sample_gen_mode = (
             (num_beams == 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode
         )
         is_beam_gen_mode = (
-            (num_beams > 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode
+            (num_beams > 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode and not is_entropy_aware_mode
         )
         is_beam_sample_gen_mode = (
             (num_beams > 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode
         )
-        is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1) and not is_constraint_gen_mode
+        is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1) and not is_constraint_gen_mode and not is_entropy_aware_mode
+
+        is_entropy_aware_decoding_gen_mode = (
+            (num_beams == 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode and is_entropy_aware_mode
+        )
 
         if num_beam_groups > num_beams:
             raise ValueError("`num_beam_groups` has to be smaller or equal to `num_beams`")
@@ -1300,6 +1385,39 @@ class GenerationMixin:
                 output_scores=output_scores,
                 return_dict_in_generate=return_dict_in_generate,
                 synced_gpus=synced_gpus,
+                **model_kwargs,
+            )
+
+        if is_entropy_aware_decoding_gen_mode:
+            if num_return_sequences > 1:
+                raise ValueError(
+                    f"num_return_sequences has to be 1, but is {num_return_sequences} when doing greedy search."
+                )
+           
+            # 10. prepare logits warper
+            logits_warper = self._get_logits_warper(
+                top_k=top_k,
+                top_p=top_p,
+                typical_p=typical_p,
+                temperature=temperature,
+                num_beams=num_beams,
+                renormalize_logits=renormalize_logits,
+            )
+
+            # 10. run entropy aware decoding
+            return self.entropy_aware_decoding(
+                input_ids,
+                logits_processor=logits_processor,
+                logits_warper=logits_warper,
+                stopping_criteria=stopping_criteria,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                output_scores=output_scores,
+                return_dict_in_generate=return_dict_in_generate,
+                synced_gpus=synced_gpus,
+                human_mean_coeffs= entropy_aware_human_mean_coeffs, 
+                human_std_coeffs= entropy_aware_human_std_coeffs, 
+                human_std_band= entropy_aware_human_std_band,
                 **model_kwargs,
             )
 
@@ -1760,6 +1878,425 @@ class GenerationMixin:
             else:
                 return GreedySearchDecoderOnlyOutput(
                     sequences=input_ids,
+                    scores=scores,
+                    attentions=decoder_attentions,
+                    hidden_states=decoder_hidden_states,
+                )
+        else:
+            return input_ids
+
+    def entropy_from_scores(self, scores):
+        logits = F.log_softmax(scores, dim=-1)
+        entropy = (-1 * logits.exp() * logits).sum(-1)
+        return entropy
+
+
+    def entropy_aware_decoding(
+        self,
+        input_ids: torch.LongTensor,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        logits_warper: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        max_length: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_scores: Optional[bool] = None,
+        return_dict_in_generate: Optional[bool] = None,
+        synced_gpus: Optional[bool] = False,
+        human_mean_coeffs: Optional[Tuple[float]] = None, 
+        human_std_coeffs: Optional[Tuple[float]] = None,
+        human_std_band: Optional[float] = None,
+        **model_kwargs,
+    ) -> Union[GreedySearchOutput, torch.LongTensor]:
+        r"""
+        Generates sequences of token ids for models with a language modeling head using **greedy decoding** and can be
+        used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
+
+        Parameters:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                The sequence used as a prompt for the generation.
+            logits_processor (`LogitsProcessorList`, *optional*):
+                An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]
+                used to modify the prediction scores of the language modeling head applied at each generation step.
+            stopping_criteria (`StoppingCriteriaList`, *optional*):
+                An instance of [`StoppingCriteriaList`]. List of instances of class derived from [`StoppingCriteria`]
+                used to tell if the generation loop should stop.
+
+            max_length (`int`, *optional*, defaults to 20):
+                **DEPRECATED**. Use `logits_processor` or `stopping_criteria` directly to cap the number of generated
+                tokens. The maximum length of the sequence to be generated.
+            pad_token_id (`int`, *optional*):
+                The id of the *padding* token.
+            eos_token_id (`int`, *optional*):
+                The id of the *end-of-sequence* token.
+            output_attentions (`bool`, *optional*, defaults to `False`):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more details.
+            output_hidden_states (`bool`, *optional*, defaults to `False`):
+                Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
+                for more details.
+            output_scores (`bool`, *optional*, defaults to `False`):
+                Whether or not to return the prediction scores. See `scores` under returned tensors for more details.
+            return_dict_in_generate (`bool`, *optional*, defaults to `False`):
+                Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+            synced_gpus (`bool`, *optional*, defaults to `False`):
+                Whether to continue running the while loop until max_length (needed for ZeRO stage 3)
+            model_kwargs:
+                Additional model specific keyword arguments will be forwarded to the `forward` function of the model.
+                If model is an encoder-decoder model the kwargs should include `encoder_outputs`.
+
+        Return:
+            [`~generation_utils.GreedySearchDecoderOnlyOutput`], [`~generation_utils.GreedySearchEncoderDecoderOutput`]
+            or `torch.LongTensor`: A `torch.LongTensor` containing the generated tokens (default behaviour) or a
+            [`~generation_utils.GreedySearchDecoderOnlyOutput`] if `model.config.is_encoder_decoder=False` and
+            `return_dict_in_generate=True` or a [`~generation_utils.GreedySearchEncoderDecoderOutput`] if
+            `model.config.is_encoder_decoder=True`.
+
+        Examples:
+
+        ```python
+        >>> from transformers import (
+        ...     AutoTokenizer,
+        ...     AutoModelForCausalLM,
+        ...     LogitsProcessorList,
+        ...     MinLengthLogitsProcessor,
+        ...     StoppingCriteriaList,
+        ...     MaxLengthCriteria,
+        ... )
+
+        >>> tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        >>> model = AutoModelForCausalLM.from_pretrained("gpt2")
+
+        >>> # set pad_token_id to eos_token_id because GPT2 does not have a EOS token
+        >>> model.config.pad_token_id = model.config.eos_token_id
+
+        >>> input_prompt = "It might be possible to"
+        >>> input_ids = tokenizer(input_prompt, return_tensors="pt").input_ids
+
+        >>> # instantiate logits processors
+        >>> logits_processor = LogitsProcessorList(
+        ...     [
+        ...         MinLengthLogitsProcessor(10, eos_token_id=model.config.eos_token_id),
+        ...     ]
+        ... )
+        >>> stopping_criteria = StoppingCriteriaList([MaxLengthCriteria(max_length=20)])
+
+        >>> outputs = model.greedy_search(
+        ...     input_ids, logits_processor=logits_processor, stopping_criteria=stopping_criteria
+        ... )
+
+        >>> tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        ["It might be possible to get a better understanding of the nature of the problem, but it's not"]
+        ```"""
+        # init values
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+        if max_length is not None:
+            warnings.warn(
+                "`max_length` is deprecated in this function, use"
+                " `stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])` instead.",
+                UserWarning,
+            )
+            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+        logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
+        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        output_scores = output_scores if output_scores is not None else self.config.output_scores
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict_in_generate = (
+            return_dict_in_generate if return_dict_in_generate is not None else self.config.return_dict_in_generate
+        )
+
+        # init attention / hidden states / scores tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
+        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
+        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+
+        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
+        if return_dict_in_generate and self.config.is_encoder_decoder:
+            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            encoder_hidden_states = (
+                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+            )
+
+        # keep track of which sequences are already finished
+        unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
+        cur_len = input_ids.shape[-1]
+        batch_size = input_ids.shape[0]
+        this_peer_finished = False  # used by synced_gpus only
+
+        patience_window = 5 
+        if "ea_patience_window" in model_kwargs:
+            patience_window = model_kwargs["ea_patience_window"]
+            del model_kwargs["ea_patience_window"]
+
+        intervene_for_upper_bound = True
+        intervene_for_lower_bound = True
+        if "ea_intervene_for_lower_bound" in model_kwargs:
+            intervene_for_lower_bound = model_kwargs["ea_intervene_for_lower_bound"]
+            del model_kwargs["ea_intervene_for_lower_bound"]
+
+        if "ea_intervene_for_upper_bound" in model_kwargs:
+            intervene_for_upper_bound = model_kwargs["ea_intervene_for_upper_bound"]
+            del model_kwargs["ea_intervene_for_upper_bound"]
+
+        self.queue = deque(maxlen=(patience_window+1))
+
+        only_greedy_till: int = 10
+        if "ea_only_greedy_till" in model_kwargs:
+            only_greedy_till = model_kwargs["ea_only_greedy_till"]
+            del model_kwargs["ea_only_greedy_till"]
+
+        assert (human_mean_coeffs is not None and 
+                        human_std_coeffs is not None and 
+                        human_std_band is not None), \
+                "You must define human_mean_coeffs and human_std_coeffs."
+
+        human_mean_poly = np.poly1d(human_mean_coeffs)
+        human_std_poly = np.poly1d(human_std_coeffs)
+
+        # This is a hardcoded value and we allow average of 10 backoffs per instance.
+        max_backoffs = batch_size * 10
+
+        entropy_violations = input_ids.new(input_ids.shape[0]).fill_(0)
+        lower_entropy_bound_violations = input_ids.new(input_ids.shape[0]).fill_(0)
+        upper_entropy_bound_violations = input_ids.new(input_ids.shape[0]).fill_(0)
+
+        total_generations = input_ids.new(input_ids.shape[0]).fill_(0)
+        rank_at_current_index = input_ids.new(input_ids.shape[0]).fill_(0).unsqueeze(1)
+
+        index = -1
+        steps_since_last_good_index = input_ids.new(input_ids.shape[0]).fill_(0)
+
+        entropy_aware_actions = []
+        backoff_indexes = []
+        num_backoffs = 0
+        generator = torch.Generator(self.device)
+        while True:
+            index += 1
+            if synced_gpus:
+                # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
+                # The following logic allows an early break if all peers finished generating their sequence
+                this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
+                # send 0.0 if we finished, 1.0 otherwise
+                dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
+                # did all peers finish? the reduced sum will be 0.0 then
+                if this_peer_finished_flag.item() == 0.0:
+                    break
+
+            # prepare model inputs
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+
+            # forward pass to get next token
+            outputs = self(
+                **model_inputs,
+                return_dict=True,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+
+            if synced_gpus and this_peer_finished:
+                cur_len = cur_len + 1
+                continue  # don't waste resources running the code we don't need
+
+            next_token_logits = outputs.logits[:, -1, :]      
+
+            entropy_score = self.entropy_from_scores(next_token_logits)
+
+            if entropies is None:
+                entropies = entropy_score.unsqueeze(1)
+            else:
+                entropies = torch.cat([entropies, entropy_score[:, None]], dim=1)
+
+            # pre-process distribution
+            next_tokens_scores = logits_processor(input_ids, next_token_logits)
+
+            # Store scores, attentions and hidden_states when required
+            if return_dict_in_generate:
+                if output_scores:
+                    scores += (next_tokens_scores,)
+                if output_attentions:
+                    decoder_attentions += (
+                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                    )
+                    if self.config.is_encoder_decoder:
+                        cross_attentions += (outputs.cross_attentions,)
+
+                if output_hidden_states:
+                    decoder_hidden_states += (
+                        (outputs.decoder_hidden_states,)
+                        if self.config.is_encoder_decoder
+                        else (outputs.hidden_states,)
+                    )
+            # argmax
+            next_tokens = torch.argmax(next_tokens_scores, dim=-1)
+
+            lower_entropy_cutoff = (human_mean_poly(index) - 
+                                        human_std_band * human_std_poly(index))
+            upper_entropy_cutoff = (human_mean_poly(index) + 
+                                        human_std_band * human_std_poly(index))
+
+            rank_at_current_index = input_ids.new(input_ids.shape[0]).fill_(0).unsqueeze(1)
+            
+            if index > only_greedy_till:
+                # Is unfinished and has entropy violation.
+                has_upper_bound_entropy_voilation = (unfinished_sequences > 0) & \
+                                                        (entropies[:, -1] > upper_entropy_cutoff)
+                
+                # If at least one upper bound entropy violation, then do sampling
+                # and replace that one. 
+                if intervene_for_upper_bound and has_upper_bound_entropy_voilation.sum() > 0:
+                    # Apply truncation/sparsity strategy.
+                    next_token_scores_for_sampling = logits_warper(input_ids, 
+                                                            next_tokens_scores)
+                    probs = F.softmax(next_token_scores_for_sampling, dim=-1)
+
+                    # sample
+                    sampled_next_tokens = torch.multinomial(probs, num_samples=1, 
+                                                            generator=generator)\
+                                                            .squeeze(1)
+
+                    # replace next tokens with sampled next tokens for the instances where 
+                    # upper bound of entropy zone was violated.
+                    next_tokens = torch.where(has_upper_bound_entropy_voilation,
+                                        sampled_next_tokens, next_tokens)
+                    rank_at_current_index = self._get_rank(next_tokens_scores, next_tokens)
+
+                    entropy_violations += has_upper_bound_entropy_voilation.int()
+                    upper_entropy_bound_violations += has_upper_bound_entropy_voilation.int()
+
+                # We either sample or be greedy. Even if we backoff, we stay greedy
+                # but with a different rank.
+                ea_actions = has_upper_bound_entropy_voilation.int()
+                entropy_aware_actions.append(ea_actions)
+
+                # Is unfinished and has a lower bound entropy violation.
+                lower_bound_violated = (unfinished_sequences > 0) & \
+                                        (entropies[:, -1] < lower_entropy_cutoff)
+                
+
+                # For the instances without lower bound violations, reset the counter
+                # For the instances where lower bound is violated, increment by one.
+                steps_since_last_good_index[lower_bound_violated] += 1
+                steps_since_last_good_index[~lower_bound_violated] = 0
+                
+                # If the sequence is unfinished right now and it has been more than 
+                # patience_window steps, we need to back off for that instance
+                need_to_do_backoffs = ((unfinished_sequences > 0) &
+                                        (steps_since_last_good_index > patience_window))
+
+                if intervene_for_lower_bound and \
+                        num_backoffs < max_backoffs and \
+                        need_to_do_backoffs.sum() > 0:
+
+                    # record that we are backing off at this index.
+                    backoff_indexes.append(index)
+
+                    # Load the saved state we are backing off to
+                    # and reset variables to that that state.
+                    backoff_state_dict = self._load_state_for_entropy_aware_backoff()
+
+                    next_tokens_scores = backoff_state_dict['next_token_scores']
+                    scores = backoff_state_dict['scores']
+                    decoder_attentions = backoff_state_dict['decoder_attentions']
+                    cross_attentions = backoff_state_dict['cross_attentions']
+                    decoder_hidden_states = backoff_state_dict['decoder_hidden_states']
+                    outputs.past_key_values = backoff_state_dict['past_key_values']
+                    model_kwargs = backoff_state_dict['model_kwargs']
+                    input_ids = backoff_state_dict['input_ids']
+                    index = backoff_state_dict['index']
+                    generator.set_state(backoff_state_dict['state'])
+                    rank_at_current_index = backoff_state_dict['ranks']
+                    steps_since_last_good_index = backoff_state_dict['steps_since_last_good_index']
+                    unfinished_sequences = backoff_state_dict['unfinished_sequences']
+                    cur_len = backoff_state_dict['cur_len']
+
+                    # Increase the rank we will be selecting at that index. 
+                    # This is useful if we are backing-off to a state more than once.
+                    rank_at_current_index[need_to_do_backoffs] += 1
+
+                    # select the token at the rank.
+                    _, sorted_indices = next_tokens_scores.sort(descending=True)
+                    next_tokens = sorted_indices.gather(1, rank_at_current_index)\
+                                            .squeeze(-1)
+
+                    entropy_violations += need_to_do_backoffs.int()
+                    lower_entropy_bound_violations += need_to_do_backoffs.int()
+
+                    # As we have backed-off, also reset the output variables.
+                    entropy_aware_actions = entropy_aware_actions[:index + 1]
+                    entropies = entropies[:, :index + 1]
+
+                    # Track number of backoffs.
+                    num_backoffs += 1
+
+                if intervene_for_lower_bound:
+                    self._save_state_for_entropy_aware_backoff(
+                        next_tokens_scores, scores, decoder_attentions,
+                        cross_attentions, decoder_hidden_states,
+                        outputs.past_key_values, model_kwargs, input_ids,
+                        index, generator.get_state(), rank_at_current_index, 
+                        steps_since_last_good_index, next_tokens, 
+                        unfinished_sequences, cur_len)
+
+                total_generations += unfinished_sequences
+
+            # finished sentences should have their next token be a padding token.
+            if eos_token_id is not None:
+                if pad_token_id is None:
+                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            # update generated ids, model inputs, and length for next step
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
+            )
+            cur_len = cur_len + 1
+
+            # if eos_token was found in one sentence, set sentence to finished
+            if eos_token_id is not None:
+                unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
+
+            # stop when each sentence is finished, or if we exceed the maximum length
+            if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
+                if not synced_gpus:
+                    break
+                else:
+                    this_peer_finished = True
+
+        if return_dict_in_generate:
+            if self.config.is_encoder_decoder:
+                return EntropyAwareDecodingEncoderDecoderOutput(
+                    sequences=input_ids,
+                    pct_entropy_violations=(entropy_violations/total_generations) * 100,
+                    pct_lower_entropy_violations=(lower_entropy_bound_violations/total_generations) * 100,
+                    pct_upper_entropy_violations=(upper_entropy_bound_violations/total_generations) * 100,
+                    entropies=entropies,
+                    backoff_indexes=backoff_indexes,
+                    entropy_aware_actions=torch.stack(entropy_aware_actions, dim=1),
+                    scores=scores,
+                    encoder_attentions=encoder_attentions,
+                    encoder_hidden_states=encoder_hidden_states,
+                    decoder_attentions=decoder_attentions,
+                    cross_attentions=cross_attentions,
+                    decoder_hidden_states=decoder_hidden_states,
+                )
+            else:
+                return EntropyAwareDecodingDecoderOnlyOutput(
+                    sequences=input_ids,
+                    pct_entropy_violations=(entropy_violations/total_generations) * 100,
+                    pct_lower_entropy_violations=(lower_entropy_bound_violations/total_generations) * 100,
+                    pct_upper_entropy_violations=(upper_entropy_bound_violations/total_generations) * 100,
+                    entropies=entropies,
+                    backoff_indexes=backoff_indexes,
+                    entropy_aware_actions=torch.stack(entropy_aware_actions, dim=1),
                     scores=scores,
                     attentions=decoder_attentions,
                     hidden_states=decoder_hidden_states,
